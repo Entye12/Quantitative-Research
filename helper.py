@@ -32,7 +32,6 @@ __all__ = [
     "ols_assumption_diagnostics",
     "joint_ols_report",
     "univariate_oos_screen",
-    "feature_stability_table",
     "feature_stability_report",
     "redundancy_screen",
     "incremental_gain_report",
@@ -155,104 +154,6 @@ def _model_summary_frame(
             }
         }
     )
-
-
-def _normalize_correlation_method(method: str) -> str:
-    method = method.lower()
-    if method not in {"pearson", "spearman"}:
-        raise ValueError("method must be either 'pearson' or 'spearman'")
-    return method
-
-
-def _correlation_statistic(x: pd.Series, y: pd.Series, method: str) -> float:
-    if method == "pearson":
-        return float(st.pearsonr(x, y).statistic)
-    return float(st.spearmanr(x, y).statistic)
-
-
-def _sign_consistency(values: np.ndarray) -> float:
-    finite = np.asarray(values, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size == 0:
-        return np.nan
-
-    non_zero = finite[finite != 0]
-    if non_zero.size == 0:
-        return 1.0
-
-    reference_sign = np.sign(np.nanmedian(non_zero))
-    return float(np.mean(np.sign(non_zero) == reference_sign))
-
-
-def _format_signed(value: float, decimals: int = 3) -> str:
-    if pd.isna(value):
-        return "NA"
-    return f"{float(value):+.{decimals}f}"
-
-
-def _format_unsigned(value: float, decimals: int = 3) -> str:
-    if pd.isna(value):
-        return "NA"
-    return f"{float(value):.{decimals}f}"
-
-
-def _format_percent(value: float, decimals: int = 0) -> str:
-    if pd.isna(value):
-        return "NA"
-    return f"{100 * float(value):.{decimals}f}%"
-
-
-def _stability_bucket(consistency: float) -> str:
-    if pd.isna(consistency):
-        return "insufficient"
-    if consistency >= 0.95:
-        return "locked-in"
-    if consistency >= 0.80:
-        return "stable"
-    if consistency >= 0.60:
-        return "mixed"
-    return "fragile"
-
-
-def _defined_min(*values: float) -> float:
-    finite = [float(v) for v in values if pd.notna(v)]
-    if not finite:
-        return np.nan
-    return min(finite)
-
-
-def _format_fold_vector(values: Sequence[float], decimals: int = 3) -> str:
-    finite = [v for v in values if pd.notna(v)]
-    if not finite:
-        return "[]"
-    return "[" + ", ".join(_format_signed(v, decimals=decimals) for v in finite) + "]"
-
-
-def _print_feature_stability_section(
-    table: pd.DataFrame,
-    *,
-    title: str,
-    limit: int,
-    decimals: int,
-) -> None:
-    _print_header(title)
-    if table.empty:
-        print("(none)")
-        return
-
-    for rank, (feature, row) in enumerate(table.head(limit).iterrows(), start=1):
-        print(
-            f"{rank:>2}. {feature}  "
-            f"corr={_format_signed(row['correlation_mean'], decimals)} ± {_format_unsigned(abs(row['correlation_std']) if pd.notna(row['correlation_std']) else np.nan, decimals)}  "
-            f"corr_sign={_format_percent(row['correlation_sign_consistency'])}  "
-            f"beta_sign={_format_percent(row['beta_sign_consistency'])}  "
-            f"t={_format_signed(row['robust_t_mean'], decimals)}  "
-            f"class={row['stability_class']}"
-        )
-        print(
-            f"    folds={int(row['stability_valid_folds'])}/{int(row['n_folds'])}  "
-            f"corr_path={_format_fold_vector(row['correlation_fold_values'], decimals)}"
-        )
 
 
 def make_cv_splits(
@@ -986,34 +887,34 @@ def univariate_oos_screen(
     return res if return_table else None
 
 
-def feature_stability_table(
+def feature_stability_report(
     X: pd.DataFrame,
     y: pd.Series,
     splits,
-    method: str = "spearman",
     robust: str = "HC3",
 ) -> pd.DataFrame:
-    """Compute fold-by-fold stability metrics for one correlation definition."""
+    """Measure how stable the sign and strength of each feature are across folds."""
     X = _ensure_numeric_frame(X)
     y = _ensure_numeric_series(y)
-    method = _normalize_correlation_method(method)
-    splits_list = list(splits)
     rows = []
 
     for col in X.columns:
-        correlation_values = []
+        pearson_values = []
+        spearman_values = []
         beta_values = []
         robust_t_values = []
 
-        for train_idx, _ in splits_list:
+        for train_idx, _ in splits:
             df = _align_xy(X.iloc[train_idx][col], y.iloc[train_idx])
             if len(df) < 8 or df["x"].nunique() < 2 or df["y"].nunique() < 2:
-                correlation_values.append(np.nan)
+                pearson_values.append(np.nan)
+                spearman_values.append(np.nan)
                 beta_values.append(np.nan)
                 robust_t_values.append(np.nan)
                 continue
 
-            correlation_values.append(_correlation_statistic(df["x"], df["y"], method))
+            pearson_values.append(st.pearsonr(df["x"], df["y"]).statistic)
+            spearman_values.append(st.spearmanr(df["x"], df["y"]).statistic)
             model = sm.OLS(df["y"], sm.add_constant(df[["x"]], has_constant="add")).fit()
             robust_model = model.get_robustcov_results(cov_type=robust)
             robust_table = pd.DataFrame(
@@ -1026,154 +927,50 @@ def feature_stability_table(
             beta_values.append(float(model.params["x"]))
             robust_t_values.append(float(robust_table.loc["x", "t value"]))
 
-        correlation_values = np.array(correlation_values, dtype=float)
+        pearson_values = np.array(pearson_values, dtype=float)
+        spearman_values = np.array(spearman_values, dtype=float)
         beta_values = np.array(beta_values, dtype=float)
         robust_t_values = np.array(robust_t_values, dtype=float)
-        valid_folds = int(np.isfinite(correlation_values).sum())
+        rows.append(
+            {
+                "feature": col,
+                "pearson_fold_values": pearson_values.tolist(),
+                "spearman_fold_values": spearman_values.tolist(),
+                "beta_fold_values": beta_values.tolist(),
+                "robust_t_fold_values": robust_t_values.tolist(),
+                "pearson_mean": float(np.nanmean(pearson_values)) if np.isfinite(pearson_values).any() else np.nan,
+                "pearson_std": float(np.nanstd(pearson_values, ddof=1))
+                if np.isfinite(pearson_values).sum() > 1
+                else np.nan,
+                "spearman_mean": float(np.nanmean(spearman_values)) if np.isfinite(spearman_values).any() else np.nan,
+                "spearman_std": float(np.nanstd(spearman_values, ddof=1))
+                if np.isfinite(spearman_values).sum() > 1
+                else np.nan,
+                "beta_mean": float(np.nanmean(beta_values)) if np.isfinite(beta_values).any() else np.nan,
+                "beta_std": float(np.nanstd(beta_values, ddof=1)) if np.isfinite(beta_values).sum() > 1 else np.nan,
+                "robust_t_mean": float(np.nanmean(robust_t_values)) if np.isfinite(robust_t_values).any() else np.nan,
+                "robust_t_std": float(np.nanstd(robust_t_values, ddof=1))
+                if np.isfinite(robust_t_values).sum() > 1
+                else np.nan,
+                "pearson_sign_consistency": float(
+                    np.nanmean(np.sign(pearson_values) == np.sign(np.nanmedian(pearson_values)))
+                )
+                if np.isfinite(pearson_values).any()
+                else np.nan,
+                "spearman_sign_consistency": float(
+                    np.nanmean(np.sign(spearman_values) == np.sign(np.nanmedian(spearman_values)))
+                )
+                if np.isfinite(spearman_values).any()
+                else np.nan,
+                "beta_sign_consistency": float(
+                    np.nanmean(np.sign(beta_values) == np.sign(np.nanmedian(beta_values)))
+                )
+                if np.isfinite(beta_values).any()
+                else np.nan,
+            }
+        )
 
-        row = {
-            "feature": col,
-            "correlation_method": method,
-            "n_folds": int(len(splits_list)),
-            "stability_valid_folds": valid_folds,
-            "stability_fold_coverage": float(valid_folds / len(splits_list)) if splits_list else np.nan,
-            "correlation_fold_values": correlation_values.tolist(),
-            "beta_fold_values": beta_values.tolist(),
-            "robust_t_fold_values": robust_t_values.tolist(),
-            "correlation_mean": float(np.nanmean(correlation_values)) if np.isfinite(correlation_values).any() else np.nan,
-            "correlation_abs_mean": float(np.nanmean(np.abs(correlation_values)))
-            if np.isfinite(correlation_values).any()
-            else np.nan,
-            "correlation_std": float(np.nanstd(correlation_values, ddof=1))
-            if np.isfinite(correlation_values).sum() > 1
-            else np.nan,
-            "beta_mean": float(np.nanmean(beta_values)) if np.isfinite(beta_values).any() else np.nan,
-            "beta_std": float(np.nanstd(beta_values, ddof=1)) if np.isfinite(beta_values).sum() > 1 else np.nan,
-            "robust_t_mean": float(np.nanmean(robust_t_values)) if np.isfinite(robust_t_values).any() else np.nan,
-            "robust_t_abs_mean": float(np.nanmean(np.abs(robust_t_values)))
-            if np.isfinite(robust_t_values).any()
-            else np.nan,
-            "robust_t_std": float(np.nanstd(robust_t_values, ddof=1))
-            if np.isfinite(robust_t_values).sum() > 1
-            else np.nan,
-            "correlation_sign_consistency": _sign_consistency(correlation_values),
-            "beta_sign_consistency": _sign_consistency(beta_values),
-        }
-
-        row[f"{method}_fold_values"] = row["correlation_fold_values"]
-        row[f"{method}_mean"] = row["correlation_mean"]
-        row[f"{method}_std"] = row["correlation_std"]
-        row[f"{method}_sign_consistency"] = row["correlation_sign_consistency"]
-        rows.append(row)
-
-    result = pd.DataFrame(rows).set_index("feature")
-    if result.empty:
-        return result
-
-    result["stability_class"] = result["beta_sign_consistency"].combine(
-        result["correlation_sign_consistency"],
-        lambda beta_cons, corr_cons: _stability_bucket(_defined_min(beta_cons, corr_cons)),
-    )
-    result["stability_score"] = (
-        result["correlation_abs_mean"].fillna(0.0)
-        * result["correlation_sign_consistency"].fillna(0.0)
-        * result["beta_sign_consistency"].fillna(0.0)
-        * result["stability_fold_coverage"].fillna(0.0)
-    )
-
-    return result.sort_values(
-        ["stability_score", "correlation_abs_mean", "robust_t_abs_mean"],
-        ascending=[False, False, False],
-    )
-
-
-def feature_stability_report(
-    X: pd.DataFrame,
-    y: pd.Series,
-    splits,
-    method: str = "spearman",
-    robust: str = "HC3",
-    decimals: int = 3,
-    top_k: int = 8,
-    show_fragile: int = 5,
-    min_valid_folds: int = 1,
-    return_table: bool = False,
-) -> Optional[pd.DataFrame]:
-    """Print an interpretable stability report and optionally return its table."""
-    splits_list = list(splits)
-    table = feature_stability_table(
-        X,
-        y,
-        splits=splits_list,
-        method=method,
-        robust=robust,
-    )
-
-    if min_valid_folds > 1 and not table.empty:
-        table = table[table["stability_valid_folds"] >= min_valid_folds]
-
-    method = _normalize_correlation_method(method)
-
-    _print_header(f"Feature stability report ({method.title()})")
-    print(f"n_samples={len(y)}  n_features={X.shape[1]}  n_folds={len(splits_list)}")
-    print(f"correlation_method={method}  robust_cov={robust}")
-    print("read as: stable features keep the same sign across folds and maintain similar correlation strength")
-    if min_valid_folds > 1:
-        print(f"filtered: min_valid_folds >= {min_valid_folds}")
-
-    if table.empty:
-        print("\n(no valid results)")
-        return table if return_table else None
-
-    stable = table[
-        (table["correlation_sign_consistency"] >= 0.80)
-        & (table["beta_sign_consistency"] >= 0.80)
-    ]
-    stable_positive = stable[stable["correlation_mean"] >= 0]
-    stable_negative = stable[stable["correlation_mean"] < 0]
-    fragile = table[
-        (table["correlation_sign_consistency"] < 0.60)
-        | (table["beta_sign_consistency"] < 0.60)
-    ].sort_values(
-        ["correlation_sign_consistency", "beta_sign_consistency", "correlation_abs_mean"],
-        ascending=[True, True, False],
-    )
-
-    _print_feature_stability_section(
-        stable_positive,
-        title=f"Most stable positive {method} signals",
-        limit=top_k,
-        decimals=decimals,
-    )
-    _print_feature_stability_section(
-        stable_negative,
-        title=f"Most stable negative {method} signals",
-        limit=top_k,
-        decimals=decimals,
-    )
-    _print_feature_stability_section(
-        fragile,
-        title="Fragile / sign-flipping features",
-        limit=show_fragile,
-        decimals=decimals,
-    )
-
-    _print_header("Summary")
-    print(
-        f"stable={int(len(stable))}/{len(table)}  "
-        f"fragile={int(len(fragile))}/{len(table)}  "
-        f"median_abs_corr={np.nanmedian(table['correlation_abs_mean']):.{decimals}f}"
-    )
-    best_feature = table.index[0]
-    best_row = table.iloc[0]
-    print(
-        f"best_overall={best_feature}  "
-        f"stability_score={best_row['stability_score']:.{decimals}f}  "
-        f"corr={_format_signed(best_row['correlation_mean'], decimals)}  "
-        f"beta_sign={_format_percent(best_row['beta_sign_consistency'])}"
-    )
-
-    return table if return_table else None
+    return pd.DataFrame(rows).set_index("feature").sort_values("beta_sign_consistency", ascending=False)
 
 
 def redundancy_screen(
@@ -1539,7 +1336,6 @@ def run_tabular_numeric_pipeline(
     metric: str = "rmse",
     ridge_alpha: float = 1.0,
     standardize: bool = True,
-    stability_method: str = "spearman",
     joint_ols_features: Optional[Sequence[str]] = None,
     base_features: Optional[Sequence[str]] = None,
     redundancy_features: Optional[Sequence[str]] = None,
@@ -1553,8 +1349,6 @@ def run_tabular_numeric_pipeline(
 
     if splits is None:
         splits = make_cv_splits(len(X), n_splits=n_splits, shuffle=shuffle, random_state=random_state)
-    else:
-        splits = list(splits)
 
     results: Dict[str, Any] = {"splits": splits}
     results["stats"] = basic_feature_stats(X)
@@ -1567,15 +1361,13 @@ def run_tabular_numeric_pipeline(
         metric=metric,
         ridge_alpha=ridge_alpha,
         standardize=standardize,
-        return_table=True,
     )
-    results["stability"] = feature_stability_table(X, y, splits=splits, method=stability_method)
+    results["stability"] = feature_stability_report(X, y, splits=splits)
 
     redundancy_cols = list(redundancy_features) if redundancy_features is not None else list(X.columns)
     results["redundancy"] = redundancy_screen(
         X[redundancy_cols],
         corr_threshold=redundancy_corr_threshold,
-        return_tables=True,
     )
 
     if joint_ols_features:
